@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+restore-tabs — reopen the tabs captured by `save-tabs`, in order, after a reboot.
+
+Reads ~/.claude/session-backups/RESTORE.json and opens one new iTerm tab per Claude
+session, running its `claude --resume <uuid>` command. It NEVER double-resumes: any
+session already live (two Claude processes on one transcript corrupt each other) is
+skipped with a note.
+
+Usage:
+  restore-tabs              # open a tab per not-already-live session
+  restore-tabs --dry-run    # print the plan, open nothing
+  restore-tabs --file PATH  # use a specific RESTORE.json (default: newest in session-backups)
+"""
+import json, os, subprocess, sys, time
+from datetime import datetime
+
+OUT_DIR = os.path.expanduser("~/.claude/session-backups")
+HERE = os.path.dirname(os.path.realpath(__file__))
+CS = os.path.join(HERE, "claude-sessions")
+
+
+def sh(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True).stdout
+    except OSError:  # binary missing (e.g. no tmux installed)
+        return ""
+
+
+def load(path):
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data.get("saved_at"), data.get("tabs", [])
+    return None, data  # legacy: bare list
+
+
+def live_uuids():
+    try:
+        data = json.loads(sh(CS, "--json", "--all"))
+    except json.JSONDecodeError:
+        return set()
+    rows = data if isinstance(data, list) else [data]
+    return {r.get("sessionId") for r in rows if r.get("sessionId")}
+
+
+def _esc(s):
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def open_tab(cmd, label):
+    """Create a tab, name it, run cmd. Return the new session's tty (e.g. /dev/ttys021)."""
+    script = f'''
+tell application "iTerm2"
+  tell current window
+    set t to (create tab with default profile)
+    set s to (current session of t)
+    tell s
+      set name to "{_esc(label)}"
+      write text "{_esc(cmd)}"
+    end tell
+    return tty of s
+  end tell
+end tell'''
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def rename_tab(tty, label):
+    script = f'''
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if (tty of s) is "{tty}" then tell s to set name to "{_esc(label)}"
+      end repeat
+    end repeat
+  end repeat
+end tell'''
+    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+
+
+def open_tab_reissue(tty, cmd):
+    """Re-send cmd into the EXISTING tab identified by tty (write fired early the first time)."""
+    script = f'''
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if (tty of s) is "{tty}" then tell s to write text "{_esc(cmd)}"
+      end repeat
+    end repeat
+  end repeat
+end tell'''
+    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+
+
+def claude_on_tty(tty):
+    """True if a claude process is running on this tty — proof the resume landed."""
+    short = tty.replace("/dev/", "")
+    out = sh("ps", "-t", short, "-o", "command=")
+    return "claude" in out
+
+
+def boot_time():
+    out = sh("sysctl", "-n", "kern.boottime")
+    import re
+    m = re.search(r"sec\s*=\s*(\d+)", out)
+    return int(m.group(1)) if m else 0
+
+
+def _saved_epoch(p):
+    try:
+        return datetime.fromisoformat(json.load(open(p)).get("saved_at")).timestamp()
+    except Exception:
+        return 0
+
+
+def choose_file():
+    """Pick the right RESTORE file. After a reboot you want the last save from BEFORE boot:
+    - RESTORE.json still predates boot  -> use it (freshly rebooted, not yet refreshed).
+    - else a RESTORE-prereboot.json preserved THIS boot (mtime > boot) -> use it.
+    - else RESTORE.json (normal operation)."""
+    boot = boot_time()
+    main_f = os.path.join(OUT_DIR, "RESTORE.json")
+    pre_f = os.path.join(OUT_DIR, "RESTORE-prereboot.json")
+    if os.path.exists(main_f) and _saved_epoch(main_f) < boot:
+        return main_f, "pre-reboot state (RESTORE.json still predates boot)"
+    if os.path.exists(pre_f) and os.path.getmtime(pre_f) > boot:
+        return pre_f, "pre-reboot snapshot (RESTORE.json was refreshed after boot)"
+    if os.path.exists(main_f):
+        return main_f, "current"
+    sys.exit("restore-tabs: no RESTORE.json — run `save-tabs` first.")
+
+
+def main():
+    args = sys.argv[1:]
+    dry = "--dry-run" in args
+    path = why = None
+    if "--file" in args:
+        path, why = args[args.index("--file") + 1], "explicit --file"
+    elif "--prereboot" in args:
+        path, why = os.path.join(OUT_DIR, "RESTORE-prereboot.json"), "explicit --prereboot"
+    else:
+        path, why = choose_file()
+    if not os.path.exists(path):
+        sys.exit(f"restore-tabs: no {path} — run `save-tabs` first.")
+    print(f"Using {os.path.basename(path)} — {why}")
+
+    saved_at, tabs = load(path)
+    claude = [t for t in tabs if t.get("kind") == "claude" and t.get("uuid")]
+    if saved_at:
+        age = ""
+        try:
+            dt = datetime.fromisoformat(saved_at)
+            hrs = (datetime.now(dt.tzinfo) - dt).total_seconds() / 3600
+            age = f"  ({hrs:.0f}h ago)" if hrs >= 1 else "  (recent)"
+        except ValueError:
+            pass
+        print(f"Snapshot saved {saved_at}{age} — {len(claude)} Claude tab(s)\n")
+
+    live = live_uuids()
+    opened = skipped = 0
+    reissued = []
+    for t in sorted(claude, key=lambda x: x["pos"]):
+        label = t.get("label") or t.get("tab")
+        if t["uuid"] in live:
+            print(f"  · {t['pos']:>2} {label}: already live — skipped")
+            skipped += 1
+            continue
+        print(f"  {'→ would open' if dry else '✓ opening'} {t['pos']:>2} {label}: {t['cmd']}")
+        if dry:
+            continue
+        tty = open_tab(t["cmd"], label)
+        opened += 1
+        # Verify the resume actually landed. `write text` can fire before the shell
+        # prompt is ready, leaving the tab at a bare shell — re-issue once if so.
+        landed = False
+        for _ in range(16):  # up to ~8s
+            time.sleep(0.5)
+            if tty and claude_on_tty(tty):
+                landed = True
+                break
+        if not landed and tty:
+            rename_tab(tty, label)
+            open_tab_reissue(tty, t["cmd"])
+            reissued.append(t["pos"])
+    print()
+    if dry:
+        print(f"dry-run: {len(claude) - skipped} tab(s) would open, {skipped} already live.")
+    else:
+        print(f"Opened {opened} tab(s); skipped {skipped} already live.")
+        if reissued:
+            print(f"Re-issued the resume on tab(s) {reissued} (first write fired early).")
+        else:
+            print("All opened tabs confirmed running claude.")
+
+
+if __name__ == "__main__":
+    main()

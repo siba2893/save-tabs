@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""
+reboot-nudge — on the first interactive shell after a reboot, print a one-line reminder
+that a pre-reboot tab set is waiting. Prints at most once per boot; prints nothing when
+there's nothing to restore. Meant to be sourced from ~/.zshrc; it stays silent and cheap
+on every other shell.
+
+No auto-spawn — it only tells you `restore-tabs` is available. You decide.
+"""
+import json, os, re, subprocess, sys
+from datetime import datetime
+
+OUT = os.path.expanduser("~/.claude/session-backups")
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout
+
+
+def boot_time():
+    m = re.search(r"sec\s*=\s*(\d+)", sh("sysctl", "-n", "kern.boottime"))
+    return int(m.group(1)) if m else 0
+
+
+def saved_epoch(p):
+    try:
+        return datetime.fromisoformat(json.load(open(p)).get("saved_at")).timestamp()
+    except Exception:
+        return 0
+
+
+def count_tabs(p):
+    try:
+        d = json.load(open(p))
+        return len([t for t in d.get("tabs", []) if t.get("kind") == "claude"])
+    except Exception:
+        return 0
+
+
+def main():
+    boot = boot_time()
+    sentinel = f"/tmp/.save-tabs-nudged-{boot}"
+    if not boot or os.path.exists(sentinel):
+        return
+    main_f = os.path.join(OUT, "RESTORE.json")
+    pre_f = os.path.join(OUT, "RESTORE-prereboot.json")
+    # Which file holds the pre-reboot tabs? (mirror restore-tabs choose_file)
+    src = None
+    if os.path.exists(main_f) and saved_epoch(main_f) < boot:
+        src = main_f
+    elif os.path.exists(pre_f) and os.path.getmtime(pre_f) > boot:
+        src = pre_f
+    n = count_tabs(src) if src else 0
+    try:
+        open(sentinel, "w").close()  # nudge at most once per boot, whether or not we print
+    except OSError:
+        pass
+    if n:
+        print(f"\033[33m↻ {n} Claude tab(s) were open before this reboot.\033[0m "
+              f"Run \033[1mrestore-tabs\033[0m to reopen them (\033[2mrestore-tabs --dry-run\033[0m to preview).")
+
+
+if __name__ == "__main__":
+    main()

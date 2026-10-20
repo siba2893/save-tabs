@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+save-tabs — capture every iTerm tab as a bulletproof RESTORE doc for a computer restart.
+
+The ONLY job: after you reboot, be able to bring every tab back. A reboot kills the
+tmux server, so `tmux attach` is worthless as a restore path — the transcript UUID is
+the only thing that survives. This tool writes `claude --resume <uuid>` for every tab,
+in tab-bar order.
+
+Two traps it is built to never fall into (both bit us hand-rolling this 2026-09-22):
+  1. Never emit `tmux attach` as a session's ONLY restore path — a reboot kills tmux.
+  2. Never trust the live sessionId blindly. A `claude --remote-control` bridge restarts
+     on its own (memory pressure, version bump) and reloads a FRESH EMPTY session, so the
+     live pid->sessionId momentarily points at a ~3KB blank instead of the real work.
+     We validate the transcript is substantial; if it is blank, we recover the last
+     substantial session for that same stable `name` from history.json (every save
+     records name -> sessionId there).
+
+Usage:
+  save-tabs            # write ~/.claude/session-backups/RESTORE.md (+ dated archive) and print the plan
+  save-tabs --print    # print only, write nothing
+"""
+import json, os, re, shlex, subprocess, sys, time
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CS = os.path.join(HERE, "claude-sessions")
+OUT_DIR = os.path.expanduser("~/.claude/session-backups")
+HISTORY = os.path.join(OUT_DIR, "history.json")
+HISTORY_KEEP = 20  # sessions remembered per name
+
+# A transcript smaller than this (and with few turns) is treated as a just-restarted
+# blank bridge, not real work — trigger the snapshot-history fallback.
+BLANK_MAX_BYTES = 200_000
+BLANK_MAX_TURNS = 2
+SUBSTANTIAL_BYTES = 1_000_000  # a fallback candidate must be at least this big to win
+
+
+def sh(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True).stdout
+    except OSError:  # binary missing (e.g. no tmux installed)
+        return ""
+
+
+def boot_time():
+    """kern.boottime -> unix seconds (macOS)."""
+    out = sh("sysctl", "-n", "kern.boottime")
+    m = re.search(r"sec\s*=\s*(\d+)", out)
+    return int(m.group(1)) if m else 0
+
+
+def preserve_prereboot():
+    """Before the first save AFTER a reboot, copy the existing RESTORE.* to RESTORE-prereboot.*
+    so the pre-reboot tab list can't be clobbered by a post-reboot auto-save. Idempotent:
+    only fires while the current RESTORE.json still predates this boot."""
+    import shutil
+    rj = os.path.join(OUT_DIR, "RESTORE.json")
+    if not os.path.exists(rj):
+        return
+    try:
+        saved = json.load(open(rj)).get("saved_at")
+        saved_epoch = datetime.fromisoformat(saved).timestamp() if saved else 0
+    except (ValueError, OSError, json.JSONDecodeError):
+        return
+    if saved_epoch and saved_epoch < boot_time():  # RESTORE.* is from before this boot
+        for ext in ("json", "md"):
+            src = os.path.join(OUT_DIR, f"RESTORE.{ext}")
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(OUT_DIR, f"RESTORE-prereboot.{ext}"))
+
+
+def size_of(path):
+    try:
+        return os.path.getsize(path) if path else 0
+    except OSError:
+        return 0
+
+
+def roster():
+    """Live Claude sessions with name, sessionId, cwd, tmux, pid, turns, topic, web."""
+    out = sh(CS, "--json", "--all")
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        sys.exit("save-tabs: could not parse `claude-sessions --json --all` — is it on PATH?")
+    return data if isinstance(data, list) else [data]
+
+
+def tty_of_pid(pid):
+    t = sh("ps", "-o", "tty=", "-p", str(pid)).strip()
+    return "/dev/" + t if t and t not in ("??", "-") else None
+
+
+def tmux_client_ttys():
+    """tmux session name -> the iTerm client tty attached to it."""
+    out = sh("tmux", "list-clients", "-F", "#{client_tty}\t#{session_name}")
+    m = {}
+    for line in out.splitlines():
+        if "\t" in line:
+            tty, sess = line.split("\t", 1)
+            m[sess] = tty  # last attached client wins; fine for our single-window setup
+    return m
+
+
+def iterm_tabs():
+    """Ordered [(pos, tty, name)] across all iTerm windows, left->right, top window first."""
+    script = r'''
+tell application "iTerm2"
+  set out to ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set out to out & (tty of s) & "\t" & (name of s) & linefeed
+      end repeat
+    end repeat
+  end repeat
+  return out
+end tell'''
+    out = sh("osascript", "-e", script)
+    tabs = []
+    for i, line in enumerate([l for l in out.splitlines() if l.strip()], 1):
+        tty, _, name = line.partition("\t")
+        tabs.append((i, tty.strip(), name.strip()))
+    return tabs
+
+
+def load_history():
+    try:
+        return json.load(open(HISTORY))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def record_history(sessions):
+    """Remember name -> [{sessionId, transcript, seen_at}], newest first, for snapshot_fallback."""
+    hist = load_history()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    for s in sessions:
+        name, sid = s.get("name"), s.get("sessionId")
+        if not name or not sid:
+            continue
+        entries = [e for e in hist.get(name, []) if e.get("sessionId") != sid]
+        entries.insert(0, {"sessionId": sid, "transcript": s.get("transcript"), "seen_at": now})
+        hist[name] = entries[:HISTORY_KEEP]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(HISTORY, "w") as f:
+        json.dump(hist, f, indent=2)
+
+
+def snapshot_fallback(name):
+    """Most recent SUBSTANTIAL (session_id, bytes) ever recorded under this name."""
+    for e in load_history().get(name or "", []):
+        b = size_of(e.get("transcript"))
+        if b >= SUBSTANTIAL_BYTES:
+            return e["sessionId"], b
+    return None
+
+
+def transcript_path(sid, cwd):
+    proj = "-" + cwd.strip("/").replace("/", "-").replace(".", "-")
+    p = os.path.expanduser(f"~/.claude/projects/{proj}/{sid}.jsonl")
+    if os.path.exists(p):
+        return p
+    import glob
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
+    return hits[0] if hits else p
+
+
+def _iso_to_local(ts):
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return dt
+    except (ValueError, AttributeError):
+        return None
+
+
+def _ago(dt):
+    if not dt:
+        return ""
+    secs = (datetime.now(dt.tzinfo) - dt).total_seconds()
+    for n, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if secs >= n:
+            return f"{int(secs // n)}{unit} ago"
+    return "just now"
+
+
+def _text_of(msg):
+    c = (msg or {}).get("content")
+    if isinstance(c, str):
+        return c.strip()
+    if isinstance(c, list):
+        parts = [p.get("text", "") for p in c if p.get("type") == "text"]
+        return " ".join(t.strip() for t in parts if t.strip())
+    return ""
+
+
+def last_messages(path):
+    """Tail a transcript: last activity time, last real message (role+text+ts), last USER message.
+
+    Skips harness noise (tool results, <system-reminder>/<command…> wrappers) so the
+    'last message' is something a human would recognise the session by.
+    """
+    out = {"last_ts": None, "last_role": None, "last_text": "",
+           "last_user_ts": None, "last_user_text": ""}
+    if not path or not os.path.exists(path):
+        return out
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 512_000))  # last ~500KB holds the recent turns
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return out
+    lines = [l for l in chunk.splitlines() if l.strip().startswith("{")]
+    for line in reversed(lines):  # newest first
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if o.get("type") not in ("user", "assistant"):
+            continue
+        if out["last_ts"] is None and o.get("timestamp"):
+            out["last_ts"] = o["timestamp"]
+        text = _text_of(o.get("message"))
+        if not text or text.startswith("<"):  # tool_result / harness wrapper
+            continue
+        if not out["last_text"]:
+            out["last_role"] = o.get("type")
+            out["last_text"] = text
+        if o.get("type") == "user" and not out["last_user_text"]:
+            out["last_user_ts"] = o.get("timestamp")
+            out["last_user_text"] = text
+        if out["last_text"] and out["last_user_text"]:
+            break
+    return out
+
+
+def resolve(sessions):
+    """Map each live session to the iTerm tab tty it appears in, and pick the real UUID."""
+    clients = tmux_client_ttys()
+    by_tty = {}
+    for s in sessions:
+        tmux = s.get("tmux")
+        if tmux:  # "coinvest:@2.%2" -> tmux session name is before the first ':'
+            tmux_sess = tmux.split(":", 1)[0]
+            tty = clients.get(tmux_sess)
+        else:
+            tty = s.get("tty") or (tty_of_pid(s.get("pid")) if s.get("pid") else None)
+        if tty:
+            by_tty[tty] = s
+    return by_tty
+
+
+def pick_uuid(s):
+    """Return (uuid, bytes, note). Validate the live sessionId; recover if it's blank."""
+    sid = s.get("sessionId")
+    cwd = s.get("cwd") or os.path.expanduser("~")
+    turns = s.get("turns") or 0
+    b = size_of(s.get("transcript") or transcript_path(sid, cwd))
+    if b < BLANK_MAX_BYTES and turns <= BLANK_MAX_TURNS:
+        fb = snapshot_fallback(s.get("name"))
+        if fb and fb[1] > b:
+            return fb[0], fb[1], "recovered via snapshot history (live bridge was on a blank session)"
+    return sid, b, ""
+
+
+def short_topic(t):
+    if not t or t.strip() in ("(nothing yet)", ""):
+        return ""
+    t = re.sub(r"^(Here'?s? (is )?a?\s*summary.*?:\s*)", "", t, flags=re.I).strip()
+    return (t[:110] + "…") if len(t) > 110 else t
+
+
+def _claude_row(pos, tab, s):
+    uuid, b, note = pick_uuid(s)
+    cwd = s.get("cwd") or os.path.expanduser("~")
+    lm = last_messages(transcript_path(uuid, cwd))
+    claude_cmd = " ".join(["claude"] + [shlex.quote(a) for a in s.get("args") or []]
+                          + ["--resume", uuid])
+    last_dt = _iso_to_local(lm["last_ts"])
+    return {
+        "pos": pos, "tab": tab, "label": s.get("name"), "kind": "claude",
+        "cwd": cwd, "uuid": uuid, "mb": b / 1e6,
+        "cmd": f"cd {shlex.quote(cwd)} && {claude_cmd}",
+        "tmux": (s.get("tmux") or "").split(":", 1)[0] if s.get("tmux") else "",
+        "topic": short_topic(s.get("topic")), "note": note, "web": s.get("web") or "",
+        "status": s.get("status") or "", "turns": s.get("turns") or 0,
+        "last_ts": lm["last_ts"],
+        "last_local": last_dt.strftime("%Y-%m-%d %H:%M") if last_dt else "",
+        "last_ago": _ago(last_dt),
+        "last_role": lm["last_role"], "last_text": lm["last_text"],
+        "last_user_text": lm["last_user_text"],
+    }
+
+
+def build():
+    """Return (rows, order_source). Prefer true iTerm tab order; if iTerm automation
+    is unavailable (e.g. run from launchd with no GUI/Automation permission), fall back
+    to every live Claude session ordered by last activity — a complete doc either way."""
+    sessions = roster()
+    record_history(sessions)
+    tabs = iterm_tabs()
+    if tabs:
+        by_tty = resolve(sessions)
+        rows = []
+        for pos, tty, name in tabs:
+            s = by_tty.get(tty)
+            if not s:
+                rows.append({"pos": pos, "tab": name, "kind": "shell/other",
+                             "cwd": "", "cmd": "", "note": "not a Claude session", "web": ""})
+            else:
+                rows.append(_claude_row(pos, name, s))
+        return rows, "iTerm tab order"
+    # Fallback: no iTerm tab order available.
+    claude = [s for s in sessions if s.get("sessionId")]
+    claude.sort(key=lambda s: s.get("last_ts") or 0, reverse=True)
+    rows = [_claude_row(i, s.get("name") or s.get("sessionId"), s)
+            for i, s in enumerate(claude, 1)]
+    return rows, "last-activity order (iTerm automation unavailable — tab order not captured)"
+
+
+def _clip(t, n):
+    t = " ".join((t or "").split())
+    return (t[:n] + "…") if len(t) > n else t
+
+
+def prune_archives(keep=20):
+    """Keep only the newest `keep` dated RESTORE-*.md archives; RESTORE.md is never touched."""
+    try:
+        dated = sorted(
+            (os.path.join(OUT_DIR, f) for f in os.listdir(OUT_DIR)
+             if f.startswith("RESTORE-") and f.endswith(".md")),
+            key=os.path.getmtime, reverse=True)
+    except OSError:
+        return
+    for p in dated[keep:]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def render_md(rows, order_source="iTerm tab order"):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M %Z")
+    L = [f"# Restore tabs — saved {now}", "",
+         f"_Order: {order_source}._", "",
+         "After a reboot, open a new iTerm tab per row (in order) and run its command.",
+         "**tmux is dead after a reboot** — the `claude --resume <uuid>` line is the real",
+         "restore path; a `tmux attach` note is only useful if you did NOT reboot.", "",
+         "| # | Tab | Session | Last activity | Restore command |",
+         "|---|---|---|---|---|"]
+    for r in rows:
+        if r["kind"] != "claude":
+            L.append(f"| {r['pos']} | {r['tab']} | — | — | _{r['note']}_ |")
+            continue
+        note = f" ⚠️ {r['note']}" if r["note"] else ""
+        last = f"{r['last_local']} ({r['last_ago']})" if r["last_local"] else "—"
+        L.append(f"| {r['pos']} | {r['tab']} | {r.get('label','')} ({r['mb']:.1f}MB){note} | {last} | `{r['cmd']}` |")
+    L += ["", "## What each tab was doing (last message)", ""]
+    for r in rows:
+        if r["kind"] != "claude":
+            continue
+        who = {"user": "you", "assistant": "Claude"}.get(r["last_role"], r["last_role"] or "?")
+        when = f"{r['last_local']} · {r['last_ago']}" if r["last_local"] else "no messages"
+        L.append(f"- **{r['pos']}. {r.get('label') or r['tab']}** — last activity {when}")
+        if r["last_text"]:
+            L.append(f"  - last message ({who}): {_clip(r['last_text'], 200)}")
+        if r["last_user_text"] and r["last_role"] != "user":
+            L.append(f"  - your last ask: {_clip(r['last_user_text'], 200)}")
+    L += ["", "## Reopen in order", "```"]
+    for r in rows:
+        if r["kind"] == "claude":
+            tail = f"   # tmux: {r['tmux']} (only if no reboot)" if r["tmux"] else ""
+            L.append(f"# {r['pos']:>2}  {(r.get('label') or r['tab'])[:22]:22}  {r['cmd']}{tail}")
+        else:
+            L.append(f"# {r['pos']:>2}  {r['tab'][:22]:22}  ({r['note']})")
+    L += ["```", ""]
+    web = [r for r in rows if r.get("web")]
+    if web:
+        L += ["## claude.ai / phone links", ""]
+        L += [f"- {r['pos']}. {r.get('label') or r['tab']}: {r['web']}" for r in web]
+        L.append("")
+    return "\n".join(L)
+
+
+def main():
+    print_only = "--print" in sys.argv
+    auto = "--auto" in sys.argv  # every-15-min launchd run: only RESTORE.md, quiet, no dated archive
+    rows, order_source = build()
+    md = render_md(rows, order_source)
+    claude_rows = [r for r in rows if r["kind"] == "claude"]
+    recovered = [r for r in claude_rows if r["note"]]
+    if not print_only:
+        # Never let an empty/degenerate run clobber a good RESTORE.md (e.g. launchd fired
+        # mid-reboot, or iTerm not up yet and no live sessions).
+        if not claude_rows:
+            print(f"[{datetime.now():%H:%M}] save-tabs: no Claude sessions — RESTORE.md left untouched.")
+            return
+        os.makedirs(OUT_DIR, exist_ok=True)
+        preserve_prereboot()  # protect a pre-reboot RESTORE.* before this post-reboot write
+        stable = os.path.join(OUT_DIR, "RESTORE.md")
+        targets = [stable] if auto else [stable, os.path.join(OUT_DIR, f"RESTORE-{datetime.now():%Y%m%d-%H%M%S}.md")]
+        for p in targets:
+            with open(p, "w") as f:
+                f.write(md)
+        with open(os.path.join(OUT_DIR, "RESTORE.json"), "w") as f:
+            json.dump({"saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                       "generated_by": "save-tabs", "order_source": order_source,
+                       "tabs": rows}, f, indent=2)
+        prune_archives(keep=20)
+        if auto:
+            print(f"[{datetime.now():%H:%M}] save-tabs: wrote RESTORE.md — "
+                  f"{len(claude_rows)} tab(s) ({order_source})")
+            return
+        print(f"Wrote {stable}")
+        for p in targets[1:]:
+            print(f"      {p}")
+    print()
+    print(md if print_only else
+          f"{len(claude_rows)} Claude tab(s) captured ({order_source}), "
+          f"{len(recovered)} recovered from snapshot history.")
+    if recovered and not print_only:
+        for r in recovered:
+            print(f"  ⚠️  tab {r['pos']} {r.get('label')}: used {r['uuid']} ({r['note']})")
+
+
+if __name__ == "__main__":
+    main()

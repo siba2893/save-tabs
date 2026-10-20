@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+claude-sessions — list live Claude Code sessions as JSON (the roster save-tabs needs).
+
+Source of truth: Claude Code writes ~/.claude/sessions/<pid>.json for every running
+interactive session (pid, sessionId, cwd, name, status). A file whose pid is dead, or
+whose pid now belongs to a non-claude process, is stale and skipped.
+
+Usage:
+  claude-sessions --json --all   # every live session, JSON list
+  claude-sessions                # short human table
+"""
+import glob, json, os, shlex, subprocess, sys
+
+SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+SMALL_BYTES = 200_000  # only count turns in small transcripts; big ones are clearly real work
+
+# Flags that pick a conversation; dropped from the original argv before appending --resume.
+SESSION_FLAGS_WITH_ARG = {"--resume", "-r", "--session-id"}
+SESSION_FLAGS = {"--continue", "-c", "--fork-session"}
+
+
+def sh(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True).stdout
+    except OSError:  # binary missing (e.g. no tmux installed)
+        return ""
+
+
+def proc_command(pid):
+    return sh("ps", "-o", "command=", "-p", str(pid)).strip()
+
+
+def is_live_claude(pid):
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return "claude" in proc_command(pid)
+
+
+def tty_of_pid(pid):
+    t = sh("ps", "-o", "tty=", "-p", str(pid)).strip()
+    return "/dev/" + t if t and t not in ("??", "-") else None
+
+
+def find_transcript(sid, cwd):
+    proj = "-" + (cwd or "").strip("/").replace("/", "-").replace(".", "-")
+    p = os.path.join(PROJECTS_DIR, proj, f"{sid}.jsonl")
+    if os.path.exists(p):
+        return p
+    hits = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{sid}.jsonl"))
+    return hits[0] if hits else None
+
+
+def count_turns(path):
+    try:
+        if os.path.getsize(path) > SMALL_BYTES:
+            return 999
+        n = 0
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"type":"user"' in line and '"tool_result"' not in line:
+                    n += 1
+        return n
+    except OSError:
+        return 0
+
+
+def launch_args(pid):
+    """Original claude flags minus any session selector, e.g. ['--dangerously-skip-permissions']."""
+    try:
+        argv = shlex.split(proc_command(pid))
+    except ValueError:
+        return []
+    out, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a in SESSION_FLAGS_WITH_ARG:
+            skip = True
+            continue
+        if a in SESSION_FLAGS or a.split("=", 1)[0] in SESSION_FLAGS_WITH_ARG:
+            continue
+        out.append(a)
+    return out
+
+
+def roster():
+    rows = []
+    for f in glob.glob(os.path.join(SESSIONS_DIR, "*.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid, sid = d.get("pid"), d.get("sessionId")
+        if not pid or not sid or d.get("kind", "interactive") != "interactive":
+            continue
+        if not is_live_claude(pid):
+            continue
+        tr = find_transcript(sid, d.get("cwd"))
+        bridge = d.get("bridgeSessionId")
+        rows.append({
+            "pid": pid, "sessionId": sid, "cwd": d.get("cwd"), "name": d.get("name"),
+            "status": d.get("status"), "tty": tty_of_pid(pid), "tmux": "",
+            "transcript": tr, "turns": count_turns(tr) if tr else 0, "topic": "",
+            "args": launch_args(pid),
+            "web": f"https://claude.ai/code/{bridge}" if bridge else "",
+            "last_ts": (d.get("updatedAt") or 0) / 1000,
+        })
+    rows.sort(key=lambda r: r["last_ts"], reverse=True)
+    return rows
+
+
+def main():
+    rows = roster()
+    if "--json" in sys.argv:
+        print(json.dumps(rows, indent=2))
+        return
+    for r in rows:
+        print(f"{r['pid']:>6}  {(r['tty'] or '-'):14} {(r['name'] or '')[:24]:24} {r['status'] or '':6} {r['cwd']}")
+
+
+if __name__ == "__main__":
+    main()
