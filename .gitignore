@@ -2,3 +2,4 @@ launchd-save-tabs.out
 launchd-save-tabs.err
 __pycache__/
 .DS_Store
+.venv/

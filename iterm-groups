@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""
+iterm-groups — read and recreate iTerm2 tab groups through the iTerm2 Python API.
+
+AppleScript has no tab-group concept, so save-tabs and restore-tabs call this helper for
+groups only; windows and tabs stay AppleScript. It runs from the venv install.sh builds
+(needs the `iterm2` package). The caller passes ITERM2_COOKIE / ITERM2_KEY, so this
+process never asks iTerm for them itself (a new TCC client under launchd could hang on an
+unanswerable Automation prompt).
+
+Usage:
+  iterm-groups --dump    # print [{"name","color","collapsed","ttys"}] for every group, in tab order
+  iterm-groups --apply   # read that shape on stdin; put the tabs owning those ttys in a group
+"""
+import json, sys
+
+import iterm2
+
+failures = 0
+
+
+async def tty_index(app):
+    """tty -> (window, tab) for every session, in window/tab order."""
+    idx = {}
+    for w in app.terminal_windows:
+        for t in w.tabs:
+            for s in t.sessions:
+                tty = await s.async_get_variable("tty")
+                if tty:
+                    idx[tty] = (w, t)
+    return idx
+
+
+async def dump(conn):
+    app = await iterm2.async_get_app(conn)
+    groups = {}
+    for tty, (_, t) in (await tty_index(app)).items():
+        g = t.tab_group
+        if g:
+            e = groups.setdefault(g.group_id, {"name": g.name, "color": g.color.hex if g.color else "",
+                                               "collapsed": g.collapsed, "ttys": []})
+            e["ttys"].append(tty)
+    print(json.dumps(list(groups.values())))
+
+
+async def apply(conn):
+    global failures
+    specs = json.load(sys.stdin)
+    app = await iterm2.async_get_app(conn)
+    idx = await tty_index(app)
+    for g in specs:
+        hits = [idx[tty] for tty in g["ttys"] if tty in idx]
+        if not hits:
+            print(f"  · group {g['name']}: none of its tabs are open — skipped")
+            continue
+        window = hits[0][0]
+        tabs = []
+        for w, t in hits:  # a group lives in one window; dedupe tabs holding several panes
+            if w.window_id == window.window_id and t.tab_id not in (x.tab_id for x in tabs):
+                tabs.append(t)
+        try:
+            color = iterm2.Color.from_hex(g["color"]) if g.get("color") else None
+            group = await window.async_create_tab_group(g["name"], tabs, color=color)
+            if g.get("collapsed"):
+                await group.async_set_collapsed(True)
+            print(f"  ✓ group {g['name']}: {len(tabs)} tab(s)")
+        except Exception as e:  # RPCException, AppVersionTooOld, ...
+            failures += 1
+            print(f"  ✗ group {g['name']}: {e}")
+
+
+def main():
+    if "--dump" in sys.argv:
+        iterm2.run_until_complete(dump)
+    elif "--apply" in sys.argv:
+        iterm2.run_until_complete(apply)
+        sys.exit(1 if failures else 0)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

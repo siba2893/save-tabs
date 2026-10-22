@@ -19,12 +19,15 @@ Two traps it is built to never fall into (both bit us hand-rolling this 2026-09-
 Usage:
   save-tabs            # write ~/.claude/session-backups/RESTORE.md (+ dated archive) and print the plan
   save-tabs --print    # print only, write nothing
+  save-tabs --auto     # launchd mode: RESTORE.md + RESTORE.json only, no dated archive, one-line log
 """
 import json, os, re, shlex, subprocess, sys, time
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 CS = os.path.join(HERE, "claude-sessions")
+GROUPS_HELPER = os.path.join(HERE, "iterm-groups")
+VENV_PY = os.path.join(HERE, ".venv", "bin", "python")  # built by install.sh
 OUT_DIR = os.path.expanduser("~/.claude/session-backups")
 HISTORY = os.path.join(OUT_DIR, "history.json")
 HISTORY_KEEP = 20  # sessions remembered per name
@@ -67,7 +70,9 @@ def preserve_prereboot():
         for ext in ("json", "md"):
             src = os.path.join(OUT_DIR, f"RESTORE.{ext}")
             if os.path.exists(src):
-                shutil.copy2(src, os.path.join(OUT_DIR, f"RESTORE-prereboot.{ext}"))
+                # copy, not copy2: restore-tabs and reboot-nudge read the copy's mtime
+                # as "preserved during this boot".
+                shutil.copy(src, os.path.join(OUT_DIR, f"RESTORE-prereboot.{ext}"))
 
 
 def size_of(path):
@@ -104,14 +109,21 @@ def tmux_client_ttys():
 
 
 def iterm_tabs():
-    """Ordered [(pos, tty, name)] across all iTerm windows, left->right, top window first."""
+    """Ordered [(pos, win, tab, pane, tty, name)] across all iTerm windows, left->right,
+    top window first. win/tab/pane are 1-based ordinals within the enumeration."""
     script = r'''
 tell application "iTerm2"
   set out to ""
+  set wn to 0
   repeat with w in windows
+    set wn to wn + 1
+    set tn to 0
     repeat with t in tabs of w
+      set tn to tn + 1
+      set pn to 0
       repeat with s in sessions of t
-        set out to out & (tty of s) & "\t" & (name of s) & linefeed
+        set pn to pn + 1
+        set out to out & wn & "\t" & tn & "\t" & pn & "\t" & (tty of s) & "\t" & (name of s) & linefeed
       end repeat
     end repeat
   end repeat
@@ -120,9 +132,37 @@ end tell'''
     out = sh("osascript", "-e", script)
     tabs = []
     for i, line in enumerate([l for l in out.splitlines() if l.strip()], 1):
-        tty, _, name = line.partition("\t")
-        tabs.append((i, tty.strip(), name.strip()))
+        parts = line.split("\t", 4)
+        if len(parts) < 5:
+            continue
+        wn, tn, pn, tty, name = parts
+        tabs.append((i, int(wn), int(tn), int(pn), tty.strip(), name.strip()))
     return tabs
+
+
+def iterm_cookie():
+    """Python API cookie+key via osascript, the client that already has Automation rights."""
+    out = sh("osascript", "-e", 'tell application "iTerm2" to request cookie and key for app named "save-tabs"')
+    cookie, _, key = out.strip().partition(" ")
+    return {"ITERM2_COOKIE": cookie, "ITERM2_KEY": key} if cookie and key else None
+
+
+def iterm_groups():
+    """Return ([{name, color, collapsed, ttys}], source). Groups are optional: any failure
+    returns ([], "unavailable: <reason>") and the save goes on without them."""
+    if not os.path.exists(VENV_PY):
+        return [], "unavailable: helper venv missing (run ./install.sh)"
+    env = iterm_cookie()
+    if not env:
+        return [], "unavailable: iTerm refused a Python API cookie"
+    try:
+        r = subprocess.run([VENV_PY, GROUPS_HELPER, "--dump"], capture_output=True, text=True,
+                           timeout=20, env={**os.environ, **env})
+        if r.returncode:
+            return [], f"unavailable: helper exit {r.returncode}: {r.stderr.strip()[-200:]}"
+        return json.loads(r.stdout), "iTerm Python API"
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        return [], f"unavailable: {type(e).__name__}"
 
 
 def load_history():
@@ -303,21 +343,32 @@ def build():
     tabs = iterm_tabs()
     if tabs:
         by_tty = resolve(sessions)
-        rows = []
-        for pos, tty, name in tabs:
+        found, groups_source = iterm_groups()
+        group_of = {tty: g for g in found for tty in g["ttys"]}
+        rows, groups = [], []
+        for pos, win, tab, pane, tty, name in tabs:
             s = by_tty.get(tty)
             if not s:
-                rows.append({"pos": pos, "tab": name, "kind": "shell/other",
-                             "cwd": "", "cmd": "", "note": "not a Claude session", "web": ""})
+                row = {"pos": pos, "tab": name, "kind": "shell/other",
+                       "cwd": "", "cmd": "", "note": "not a Claude session", "web": ""}
             else:
-                rows.append(_claude_row(pos, name, s))
-        return rows, "iTerm tab order"
+                row = _claude_row(pos, name, s)
+            g = group_of.get(tty)
+            row.update({"win": win, "tab_idx": tab, "pane": pane, "group": g["name"] if g else ""})
+            rows.append(row)
+            # A group's window comes from its first AppleScript row, so the two
+            # enumerations never have to agree on window identity.
+            if g and not any(x["name"] == g["name"] and x["win"] == win for x in groups):
+                groups.append({"win": win, "name": g["name"], "color": g["color"],
+                               "collapsed": g["collapsed"]})
+        return rows, "iTerm tab order", groups, groups_source
     # Fallback: no iTerm tab order available.
     claude = [s for s in sessions if s.get("sessionId")]
     claude.sort(key=lambda s: s.get("last_ts") or 0, reverse=True)
     rows = [_claude_row(i, s.get("name") or s.get("sessionId"), s)
             for i, s in enumerate(claude, 1)]
-    return rows, "last-activity order (iTerm automation unavailable — tab order not captured)"
+    return (rows, "last-activity order (iTerm automation unavailable — tab order not captured)",
+            [], "unavailable: no iTerm tab list")
 
 
 def _clip(t, n):
@@ -330,7 +381,7 @@ def prune_archives(keep=20):
     try:
         dated = sorted(
             (os.path.join(OUT_DIR, f) for f in os.listdir(OUT_DIR)
-             if f.startswith("RESTORE-") and f.endswith(".md")),
+             if re.fullmatch(r"RESTORE-\d{8}-\d{6}\.md", f)),
             key=os.path.getmtime, reverse=True)
     except OSError:
         return
@@ -341,22 +392,29 @@ def prune_archives(keep=20):
             pass
 
 
-def render_md(rows, order_source="iTerm tab order"):
+def _where(r):
+    """'w1 · OE' style window/group tag; '' for rows saved without window info."""
+    if "win" not in r:
+        return ""
+    return f"w{r['win']}" + (f" · {r['group']}" if r.get("group") else "")
+
+
+def render_md(rows, order_source="iTerm tab order", groups_source=""):
     now = datetime.now().strftime("%Y-%m-%d %H:%M %Z")
     L = [f"# Restore tabs — saved {now}", "",
-         f"_Order: {order_source}._", "",
+         f"_Order: {order_source}._", f"_Groups: {groups_source}._" if groups_source else "", "",
          "After a reboot, open a new iTerm tab per row (in order) and run its command.",
          "**tmux is dead after a reboot** — the `claude --resume <uuid>` line is the real",
          "restore path; a `tmux attach` note is only useful if you did NOT reboot.", "",
-         "| # | Tab | Session | Last activity | Restore command |",
-         "|---|---|---|---|---|"]
+         "| # | Window · group | Tab | Session | Last activity | Restore command |",
+         "|---|---|---|---|---|---|"]
     for r in rows:
         if r["kind"] != "claude":
-            L.append(f"| {r['pos']} | {r['tab']} | — | — | _{r['note']}_ |")
+            L.append(f"| {r['pos']} | {_where(r)} | {r['tab']} | — | — | _{r['note']}_ |")
             continue
         note = f" ⚠️ {r['note']}" if r["note"] else ""
         last = f"{r['last_local']} ({r['last_ago']})" if r["last_local"] else "—"
-        L.append(f"| {r['pos']} | {r['tab']} | {r.get('label','')} ({r['mb']:.1f}MB){note} | {last} | `{r['cmd']}` |")
+        L.append(f"| {r['pos']} | {_where(r)} | {r['tab']} | {r.get('label','')} ({r['mb']:.1f}MB){note} | {last} | `{r['cmd']}` |")
     L += ["", "## What each tab was doing (last message)", ""]
     for r in rows:
         if r["kind"] != "claude":
@@ -369,7 +427,11 @@ def render_md(rows, order_source="iTerm tab order"):
         if r["last_user_text"] and r["last_role"] != "user":
             L.append(f"  - your last ask: {_clip(r['last_user_text'], 200)}")
     L += ["", "## Reopen in order", "```"]
+    win = None
     for r in rows:
+        if r.get("win") != win and "win" in r:
+            win = r["win"]
+            L.append(f"# ── window {win} ──")
         if r["kind"] == "claude":
             tail = f"   # tmux: {r['tmux']} (only if no reboot)" if r["tmux"] else ""
             L.append(f"# {r['pos']:>2}  {(r.get('label') or r['tab'])[:22]:22}  {r['cmd']}{tail}")
@@ -387,8 +449,8 @@ def render_md(rows, order_source="iTerm tab order"):
 def main():
     print_only = "--print" in sys.argv
     auto = "--auto" in sys.argv  # every-15-min launchd run: only RESTORE.md, quiet, no dated archive
-    rows, order_source = build()
-    md = render_md(rows, order_source)
+    rows, order_source, groups, groups_source = build()
+    md = render_md(rows, order_source, groups_source)
     claude_rows = [r for r in rows if r["kind"] == "claude"]
     recovered = [r for r in claude_rows if r["note"]]
     if not print_only:
@@ -407,11 +469,13 @@ def main():
         with open(os.path.join(OUT_DIR, "RESTORE.json"), "w") as f:
             json.dump({"saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                        "generated_by": "save-tabs", "order_source": order_source,
+                       "groups_source": groups_source, "groups": groups,
                        "tabs": rows}, f, indent=2)
         prune_archives(keep=20)
         if auto:
             print(f"[{datetime.now():%H:%M}] save-tabs: wrote RESTORE.md — "
-                  f"{len(claude_rows)} tab(s) ({order_source})")
+                  f"{len(claude_rows)} tab(s) ({order_source}), {len(groups)} group(s)"
+                  + ("" if groups_source == "iTerm Python API" else f" [groups {groups_source}]"))
             return
         print(f"Wrote {stable}")
         for p in targets[1:]:
@@ -419,6 +483,7 @@ def main():
     print()
     print(md if print_only else
           f"{len(claude_rows)} Claude tab(s) captured ({order_source}), "
+          f"{len(groups)} group(s) ({groups_source}), "
           f"{len(recovered)} recovered from snapshot history.")
     if recovered and not print_only:
         for r in recovered:

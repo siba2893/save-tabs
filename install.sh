@@ -4,6 +4,9 @@
 # Undo with ./install.sh --uninstall.
 # Scripts are copied (not run from this repo) because launchd jobs cannot read
 # ~/Documents without Full Disk Access (TCC: "Operation not permitted").
+# Tab groups need the `iterm2` Python package: it goes in a venv under the install dir,
+# built here with uv on /usr/bin/python3 (the interpreter launchd already runs), so
+# nothing resolves packages or the network at save/restore time.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/.local/bin"
@@ -27,6 +30,14 @@ for f in save-tabs restore-tabs reboot-nudge claude-sessions; do
   install -m 755 "$HERE/$f" "$DEST/$f"
   ln -sf "$DEST/$f" "$BIN/$f"
 done
+install -m 755 "$HERE/iterm-groups" "$DEST/iterm-groups"
+
+if command -v uv >/dev/null; then
+  [ -x "$DEST/.venv/bin/python" ] || uv venv -q --python /usr/bin/python3 "$DEST/.venv"
+  uv pip install -q --python "$DEST/.venv/bin/python" iterm2==2.30
+else
+  echo "warning: uv not found — tab groups will not be saved or restored." >&2
+fi
 
 sed -e "s#__INSTALL_DIR__#$DEST#g" -e "s#__HOME__#$HOME#g" "$HERE/$LABEL.plist" > "$PLIST"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
