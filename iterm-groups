@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-iterm-groups — read and recreate iTerm2 tab groups through the iTerm2 Python API.
+iterm-groups — read and recreate iTerm2 tab groups and split-pane sizes through the
+iTerm2 Python API.
 
-AppleScript has no tab-group concept, so save-tabs and restore-tabs call this helper for
-groups only; windows and tabs stay AppleScript. It runs from the venv install.sh builds
+AppleScript has no tab-group concept and cannot read or size split panes, so save-tabs
+and restore-tabs call this helper for those only; creating windows, tabs and panes stays
+AppleScript. It runs from the venv install.sh builds
 (needs the `iterm2` package). The caller passes ITERM2_COOKIE / ITERM2_KEY, so this
 process never asks iTerm for them itself (a new TCC client under launchd could hang on an
 unanswerable Automation prompt).
 
 Usage:
-  iterm-groups --dump    # print [{"name","color","collapsed","ttys"}] for every group, in tab order
-  iterm-groups --apply   # read that shape on stdin; put the tabs owning those ttys in a group
+  iterm-groups --dump    # print {"groups": [...], "layouts": [...]} (shapes below)
+  iterm-groups --apply   # read that same shape on stdin: group the tabs owning those ttys,
+                         # then resize each split tab's panes to the saved proportions
+
+  group:  {"name", "color", "collapsed", "ttys": [tty, ...]}
+  layout: split tree of a tab with 2+ panes, leaves {"tty", "w", "h"} (cells),
+          splitters {"vertical": bool, "children": [...]}
 """
 import json, sys
 
@@ -31,24 +38,81 @@ async def tty_index(app):
     return idx
 
 
+async def tree_of(node):
+    if isinstance(node, iterm2.Splitter):
+        return {"vertical": node.vertical, "children": [await tree_of(c) for c in node.children]}
+    size = node.grid_size
+    return {"tty": await node.async_get_variable("tty"), "w": size.width, "h": size.height}
+
+
+def extent(tree):
+    """(width, height) in cells of a tree: siblings add up along the split axis."""
+    if "tty" in tree:
+        return tree["w"], tree["h"]
+    sizes = [extent(c) for c in tree["children"]]
+    if tree["vertical"]:  # vertical dividers: panes side by side
+        return sum(w for w, _ in sizes), max(h for _, h in sizes)
+    return max(w for w, _ in sizes), sum(h for _, h in sizes)
+
+
 async def dump(conn):
     app = await iterm2.async_get_app(conn)
-    groups = {}
+    groups, layouts = {}, []
     for tty, (_, t) in (await tty_index(app)).items():
         g = t.tab_group
         if g:
             e = groups.setdefault(g.group_id, {"name": g.name, "color": g.color.hex if g.color else "",
                                                "collapsed": g.collapsed, "ttys": []})
             e["ttys"].append(tty)
-    print(json.dumps(list(groups.values())))
+    for w in app.terminal_windows:
+        for t in w.tabs:
+            if len(t.sessions) > 1:
+                layouts.append(await tree_of(t.root))
+    print(json.dumps({"groups": list(groups.values()), "layouts": layouts}))
+
+
+async def resize(app, saved):
+    """Scale the saved pane sizes to the restored tab's current extent and apply them."""
+    leaves = []
+
+    def collect(node):
+        if "tty" in node:
+            leaves.append(node)
+        else:
+            for c in node["children"]:
+                collect(c)
+    collect(saved)
+    sessions = {}
+    tab = None
+    for w in app.terminal_windows:
+        for t in w.tabs:
+            for s in t.sessions:
+                tty = await s.async_get_variable("tty")
+                if tty in (l["tty"] for l in leaves):
+                    sessions[tty], tab = s, t
+    if tab is None or len(sessions) != len(leaves):
+        raise RuntimeError("not every pane of the tab is open")
+    now_w, now_h = extent(await tree_of(tab.root))
+    was_w, was_h = extent(saved)
+    for l in leaves:
+        sessions[l["tty"]].preferred_size = iterm2.util.Size(max(1, round(l["w"] * now_w / was_w)),
+                                                             max(1, round(l["h"] * now_h / was_h)))
+    await tab.async_update_layout()
+    return len(leaves)
 
 
 async def apply(conn):
     global failures
-    specs = json.load(sys.stdin)
+    spec = json.load(sys.stdin)
     app = await iterm2.async_get_app(conn)
     idx = await tty_index(app)
-    for g in specs:
+    for layout in spec.get("layouts", []):
+        try:
+            print(f"  ✓ split panes resized: {await resize(app, layout)} pane(s)")
+        except Exception as e:
+            failures += 1
+            print(f"  ✗ split pane sizes: {e}")
+    for g in spec.get("groups", []):
         hits = [idx[tty] for tty in g["ttys"] if tty in idx]
         if not hits:
             print(f"  · group {g['name']}: none of its tabs are open — skipped")

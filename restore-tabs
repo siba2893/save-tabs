@@ -7,10 +7,12 @@ session, running its `claude --resume <uuid>` command. It NEVER double-resumes: 
 session already live (two Claude processes on one transcript corrupt each other) is
 skipped with a note.
 
-Windows and tab groups come back too: the first saved window reuses the current iTerm
-window, every other saved window gets a new one, and each saved group is recreated
-(name, color, collapsed) around its reopened tabs via the `iterm-groups` helper. Files
-saved before windows/groups were recorded restore into one window, as before.
+Windows, tab groups and split panes come back too: the first saved window reuses the
+current iTerm window, every other saved window gets a new one, a split tab is rebuilt
+pane by pane (panes that held no Claude session come back as empty shells, so the layout
+holds), and the `iterm-groups` helper recreates each group (name, color, collapsed) and
+resizes the panes to the saved proportions. Files saved before windows/groups/splits were
+recorded restore one tab per session in one window, as before.
 
 Usage:
   restore-tabs              # open a tab per not-already-live session
@@ -37,12 +39,12 @@ def sh(*args):
 
 
 def load(path):
-    """Return (saved_at, tabs, groups)."""
+    """Return the RESTORE data as a dict with saved_at, tabs, groups, layouts."""
     with open(path) as f:
         data = json.load(f)
-    if isinstance(data, dict):
-        return data.get("saved_at"), data.get("tabs", []), data.get("groups", [])
-    return None, data, []  # legacy: bare list
+    if isinstance(data, list):  # legacy: bare list
+        data = {"tabs": data}
+    return {"saved_at": None, "groups": [], "layouts": [], **data}
 
 
 def live_uuids():
@@ -75,14 +77,69 @@ tell application "iTerm2"
     set s to (current session of t)
   end if
   tell s
-    set name to "{_esc(label)}"
-    write text "{_esc(cmd)}"
+    {f'set name to "{_esc(label)}"' if label else ""}
+    {f'write text "{_esc(cmd)}"' if cmd else ""}
   end tell
   return ((id of w) as text) & " " & (tty of s)
 end tell'''
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     win_id, _, tty = r.stdout.strip().partition(" ")
     return win_id, tty, r.stderr.strip()
+
+
+def split_pane(tty, vertical, cmd, label):
+    """Split the session on `tty` (vertical = side by side), name the new pane, run cmd
+    (none: leave a shell). The new pane goes right of / below the old one.
+    Return (tty, error) like open_tab."""
+    direction = "vertically" if vertical else "horizontally"
+    script = f'''
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if (tty of s) is "{tty}" then
+          tell s to set n to (split {direction} with default profile)
+          tell n
+            {f'set name to "{_esc(label)}"' if label else ""}
+            {f'write text "{_esc(cmd)}"' if cmd else ""}
+          end tell
+          return tty of n
+        end if
+      end repeat
+    end repeat
+  end repeat
+end tell'''
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return r.stdout.strip(), r.stderr.strip() or ("" if r.stdout.strip() else f"no pane on {tty}")
+
+
+def leaves(tree):
+    return [tree["pos"]] if "pos" in tree else [p for c in tree["children"] for p in leaves(c)]
+
+
+def build_splits(tree, tty, launch, tty_of):
+    """Recreate `tree` inside the pane on `tty`, which fills the tree's area. Siblings are
+    split off first, each from the previous one, so they land in saved order; then each
+    child is built inside its own pane. launch(pos) -> (cmd, label) for a leaf's pane."""
+    if "pos" in tree:
+        return
+    ttys = [tty]
+    for child in tree["children"][1:]:
+        first = leaves(child)[0]
+        new, err = split_pane(ttys[-1], tree["vertical"], *launch(first))
+        if not new:
+            raise RuntimeError(err)
+        tty_of[first] = new
+        ttys.append(new)
+    for child, t in zip(tree["children"], ttys):
+        build_splits(child, t, launch, tty_of)
+
+
+def with_ttys(tree, tty_of):
+    """The saved layout with each leaf's pos swapped for the tty it was restored on."""
+    if "pos" in tree:
+        return {"tty": tty_of[tree["pos"]], "w": tree["w"], "h": tree["h"]}
+    return {"vertical": tree["vertical"], "children": [with_ttys(c, tty_of) for c in tree["children"]]}
 
 
 def iterm_cookie():
@@ -93,19 +150,20 @@ def iterm_cookie():
 
 
 def apply_groups(specs):
-    """Recreate tab groups through the iterm-groups helper. Print what happened; never raise."""
+    """Recreate tab groups and pane sizes through the iterm-groups helper. Print what
+    happened; never raise."""
     if not os.path.exists(VENV_PY):
-        print("Groups not recreated: helper venv missing (run ./install.sh).")
+        print("Groups and pane sizes not restored: helper venv missing (run ./install.sh).")
         return
     env = iterm_cookie()
     if not env:
-        print("Groups not recreated: iTerm refused a Python API cookie.")
+        print("Groups and pane sizes not restored: iTerm refused a Python API cookie.")
         return
     try:
         r = subprocess.run([VENV_PY, GROUPS_HELPER, "--apply"], input=json.dumps(specs),
                            capture_output=True, text=True, timeout=30, env={**os.environ, **env})
     except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"Groups not recreated: {type(e).__name__}.")
+        print(f"Groups and pane sizes not restored: {type(e).__name__}.")
         return
     if r.stdout.strip():
         print(r.stdout.rstrip())
@@ -194,7 +252,8 @@ def main():
         sys.exit(f"restore-tabs: no {path} — run `save-tabs` first.")
     print(f"Using {os.path.basename(path)} — {why}")
 
-    saved_at, tabs, groups = load(path)
+    data = load(path)
+    saved_at, tabs, groups = data["saved_at"], data["tabs"], data["groups"]
     claude = [t for t in tabs if t.get("kind") == "claude" and t.get("uuid")]
     if saved_at:
         age = ""
@@ -204,70 +263,133 @@ def main():
             age = f"  ({hrs:.0f}h ago)" if hrs >= 1 else "  (recent)"
         except ValueError:
             pass
-        print(f"Snapshot saved {saved_at}{age} — {len(claude)} Claude tab(s)\n")
+        print(f"Snapshot saved {saved_at}{age} — {len(claude)} Claude session(s)\n")
 
     live = live_uuids()
-    opened = skipped = 0
-    reissued, failed = [], []
+    by_pos = {t["pos"]: t for t in tabs}
+    layouts = {(l["win"], l["tab_idx"]): l["tree"] for l in data["layouts"]}
+    # One unit per saved iTerm tab; rows saved without tab_idx are one unit each.
+    units = {}
+    for t in sorted(tabs, key=lambda x: x["pos"]):
+        key = (t.get("win", 1), t["tab_idx"]) if "tab_idx" in t else ("pos", t["pos"])
+        units.setdefault(key, []).append(t)
     first_win = min((t.get("win", 1) for t in claude), default=1)
     win_ids = {}  # saved window number -> iTerm window id of the window we restore it into
-    group_ttys = {}  # (saved window, group name) -> ttys of reopened member tabs
-    for t in sorted(claude, key=lambda x: x["pos"]):
-        label = t.get("label") or t.get("tab")
-        win = t.get("win", 1)
-        where = f"[w{win}" + (f" · {t['group']}]" if t.get("group") else "]")
-        if t["uuid"] in live:
-            print(f"  · {t['pos']:>2} {where} {label}: already live — skipped")
-            skipped += 1
+    pending = []  # (tty, row) of every resume sent; verified after all tabs are open
+    restored_layouts = []  # saved split trees, leaves now keyed by their restored tty
+    skipped, n_splits = 0, 0
+    reissued, failed = [], []
+
+    def label_of(t):
+        return t.get("label") or t.get("tab")
+
+    def where_of(t, n_panes=1):
+        tag = f"w{t.get('win', 1)}" + (f" · {t['group']}" if t.get("group") else "")
+        return f"[{tag}" + (f" · pane {t.get('pane', 1)}/{n_panes}]" if n_panes > 1 else "]")
+
+    for key, rows in units.items():
+        todo = []
+        for t in rows:
+            if t.get("kind") != "claude" or not t.get("uuid"):
+                continue
+            if t["uuid"] in live:
+                print(f"  · {t['pos']:>2} {where_of(t)} {label_of(t)}: already live — skipped")
+                skipped += 1
+            else:
+                todo.append(t)
+        if not todo:
             continue
-        print(f"  {'→ would open' if dry else '✓ opening'} {t['pos']:>2} {where} {label}: {t['cmd']}")
+        tree = layouts.get(key) if len(rows) > 1 else None
+        if tree and set(leaves(tree)) != {t["pos"] for t in rows}:
+            tree = None  # layout does not match the rows: one tab per session instead
+        win = todo[0].get("win", 1)
+        for t in todo:
+            print(f"  {'→ would open' if dry else '✓ opening'} {t['pos']:>2} "
+                  f"{where_of(t, len(rows) if tree else 1)} {label_of(t)}: {t['cmd']}")
+        if tree:
+            n_splits += 1
+            if len(rows) > len(todo):
+                print(f"       + {len(rows) - len(todo)} empty pane(s) to keep the split layout")
         if dry:
             continue
+
         # Resolve "current window" to an id once: it moves to every window we create.
-        win_id, tty, err = open_tab(t["cmd"], label,
-                                    win_ids.get(win) or ("current" if win == first_win else "new"))
-        if not tty:
-            print(f"    ✗ could not open a tab: {err or 'osascript returned no tty'}")
-            failed.append(t["pos"])
+        def target():
+            return win_ids.get(win) or ("current" if win == first_win else "new")
+
+        if not tree:
+            for t in todo:
+                win_id, tty, err = open_tab(t["cmd"], label_of(t), target())
+                if not tty:
+                    print(f"    ✗ could not open a tab: {err or 'osascript returned no tty'}")
+                    failed.append(t["pos"])
+                    continue
+                win_ids.setdefault(win, win_id)
+                pending.append((tty, t))
             continue
-        win_ids.setdefault(win, win_id)
+
+        def launch(pos):
+            t = by_pos[pos]
+            return (t["cmd"], label_of(t)) if t in todo else ("", "")  # empty pane: plain shell
+
+        first = leaves(tree)[0]
+        tty_of = {}
+        win_id, tty, err = open_tab(*launch(first), target())
+        try:
+            if not tty:
+                raise RuntimeError(err or "osascript returned no tty")
+            win_ids.setdefault(win, win_id)
+            tty_of[first] = tty
+            build_splits(tree, tty, launch, tty_of)
+            restored_layouts.append(with_ttys(tree, tty_of))
+        except RuntimeError as e:
+            print(f"    ✗ could not rebuild the split tab: {e}")
+        for t in todo:
+            if t["pos"] in tty_of:
+                pending.append((tty_of[t["pos"]], t))
+            else:
+                failed.append(t["pos"])
+
+    # Verify each resume actually landed. `write text` can fire before the shell prompt
+    # is ready, leaving the pane at a bare shell — re-issue once if so.
+    waiting = list(pending)
+    for _ in range(16):  # up to ~8s
+        if not waiting:
+            break
+        time.sleep(0.5)
+        waiting = [(tty, t) for tty, t in waiting if not claude_on_tty(tty)]
+    for tty, t in waiting:
+        rename_tab(tty, label_of(t))
+        open_tab_reissue(tty, t["cmd"])
+        reissued.append(t["pos"])
+
+    group_ttys = {}  # (saved window, group name) -> ttys of reopened member panes
+    for tty, t in pending:
         if t.get("group"):
-            group_ttys.setdefault((win, t["group"]), []).append(tty)
-        opened += 1
-        # Verify the resume actually landed. `write text` can fire before the shell
-        # prompt is ready, leaving the tab at a bare shell — re-issue once if so.
-        landed = False
-        for _ in range(16):  # up to ~8s
-            time.sleep(0.5)
-            if claude_on_tty(tty):
-                landed = True
-                break
-        if not landed:
-            rename_tab(tty, label)
-            open_tab_reissue(tty, t["cmd"])
-            reissued.append(t["pos"])
-    specs = [{"name": g["name"], "color": g.get("color", ""), "collapsed": g.get("collapsed", False),
-              "ttys": group_ttys[(g["win"], g["name"])]}
-             for g in groups if group_ttys.get((g["win"], g["name"]))]
-    if specs:
+            group_ttys.setdefault((t.get("win", 1), t["group"]), []).append(tty)
+    specs = {"groups": [{"name": g["name"], "color": g.get("color", ""),
+                         "collapsed": g.get("collapsed", False),
+                         "ttys": group_ttys[(g["win"], g["name"])]}
+                        for g in groups if group_ttys.get((g["win"], g["name"]))],
+             "layouts": restored_layouts}
+    if specs["groups"] or specs["layouts"]:
         print()
         apply_groups(specs)
     print()
     if dry:
         n_win = len({t.get("win", 1) for t in claude if t["uuid"] not in live})
-        print(f"dry-run: {len(claude) - skipped} tab(s) would open in {n_win} window(s), "
-              f"{len(groups)} group(s) to recreate, {skipped} already live.")
+        print(f"dry-run: {len(claude) - skipped} session(s) would open in {n_win} window(s), "
+              f"{n_splits} split tab(s), {len(groups)} group(s) to recreate, {skipped} already live.")
     else:
-        print(f"Opened {opened} tab(s); skipped {skipped} already live.")
+        print(f"Opened {len(pending)} session(s), {n_splits} split tab(s); skipped {skipped} already live.")
         if failed:
-            print(f"Failed to open tab(s) {failed} — check iTerm's Automation permission.")
+            print(f"Failed to open {failed} — check iTerm's Automation permission.")
         if reissued:
-            print(f"Re-issued the resume on tab(s) {reissued} (first write fired early).")
-        elif opened:
-            print("All opened tabs confirmed running claude.")
+            print(f"Re-issued the resume on {reissued} (first write fired early).")
+        elif pending:
+            print("All opened sessions confirmed running claude.")
         if failed:
             sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

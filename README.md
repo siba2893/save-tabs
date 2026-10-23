@@ -12,13 +12,17 @@ Adapted from https://gist.github.com/sifxtreme/fe334f486a2e9aea6f84232c0e1e5120.
 - **No snapshot DB.** Each save records `name -> sessionId` in
   `~/.claude/session-backups/history.json`; the blank-bridge fallback reads that file.
 - **tmux is optional.** A missing binary returns empty output instead of a crash.
-- **Windows and tab groups.** Each row records its iTerm window and its native tab group
-  (iTerm2 3.7+). `restore-tabs` puts the first saved window's tabs in the current window,
-  opens a new window for each other saved window, and recreates each group (name, color,
-  collapsed). AppleScript has no group API, so the `iterm-groups` helper reads and
-  creates groups through the iTerm2 Python API (`iterm2` package, in a venv that
-  `install.sh` builds with uv). If the helper is unavailable, tabs and windows still save
-  and restore, and RESTORE.md shows the reason on its `_Groups:` line.
+- **Windows, tab groups and split panes.** Each row records its iTerm window, tab, pane
+  and native tab group (iTerm2 3.7+), and each split tab records its pane tree (split
+  direction and pane sizes). `restore-tabs` puts the first saved window's tabs in the
+  current window, opens a new window for each other saved window, rebuilds each split tab
+  pane by pane, then recreates each group (name, color, collapsed) and resizes the panes to
+  the saved proportions. A pane that held no Claude session comes back as an empty shell,
+  so the layout holds. AppleScript cannot see groups or pane layout, so the `iterm-groups`
+  helper reads them and applies groups and sizes through the iTerm2 Python API (`iterm2`
+  package, in a venv that `install.sh` builds with uv). If the helper is unavailable,
+  every session still saves and restores as its own tab, in its window, and RESTORE.md
+  shows the reason on its `_Groups and split panes:` line.
 - **Install:** run `./install.sh` (undo: `./install.sh --uninstall`). It copies the scripts to
   `~/.local/share/save-tabs`, because a launchd job cannot read `~/Documents` (TCC). Re-run it
   after you edit a script here.
@@ -87,5 +91,5 @@ If the LaunchAgent has no Automation permission for iTerm, `save-tabs --auto` st
 saves every live session, but in last-activity order instead of tab order (the
 `_Order:` line in `RESTORE.md` says which).
 
-`restore-tabs` reopens Claude tabs only; plain shell tabs are listed but not reopened.
-Split panes come back as separate tabs (in the same window and group).
+`restore-tabs` reopens Claude tabs only; a tab with no Claude session in any pane is
+listed but not reopened.
