@@ -1,6 +1,12 @@
 # save-tabs — bring your terminal back after a restart
 
-Adapted from https://gist.github.com/sifxtreme/fe334f486a2e9aea6f84232c0e1e5120.
+## Credits
+
+The idea and the original `save-tabs`, `restore-tabs`, `reboot-nudge` and LaunchAgent
+come from **Asif Ahmed** ([@sifxtreme](https://github.com/sifxtreme), [sifxtreme.com](https://sifxtreme.com)),
+published in the gist
+[save-tabs: bring your terminal back after a Mac restart](https://gist.github.com/sifxtreme/fe334f486a2e9aea6f84232c0e1e5120).
+This repository adapts that work; the changes are listed below.
 
 ## Local changes vs. the gist
 
